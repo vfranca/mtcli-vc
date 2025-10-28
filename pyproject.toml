@@ -1,0 +1,59 @@
+[project]
+name = "mtcli-vc"
+version = "1.0.0.dev0"
+description = "Plugin do mtcli"
+authors = [
+    {name = "Valmir França da Silva",email = "vfranca3@gmail.com"}
+]
+readme = "README.md"
+license = "GPL-3.0"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "mtcli>=3.2.0",
+    "click (>=8.3.0,<9.0.0)",
+    "metatrader5 (>=5.0.5370,<6.0.0)",
+    "pandas (>=2.3.3,<3.0.0)"
+]
+
+[project.entry-points."mtcli.plugins"]
+mtcli_vc = "mtcli_vc.plugin:register"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+pytest-cov = "^6.2.1"
+pytest-mock = "^3.15.1"
+ruff = "^0.14.1"
+
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.6.1"
+pymdown-extensions = "^10.16.1"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",    # Estilo
+  "F",    # Lógica
+  "B",    # Boas práticas
+  "I",    # Imports
+  "UP",   # Upgrade
+  "N",    # Naming
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mtcli", "mtcli_vc"]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+skip-magic-trailing-comma = false

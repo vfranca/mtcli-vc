@@ -1,0 +1,23 @@
+site_name: plugin-exemplo
+repo_url: https://github.com/vfranca/plugin-exemplo
+repo_name: vfranca/plugin-exemplo
+
+theme:
+  name: mkdocs
+  locale: pt_BR
+
+nav:
+  - Início: index.md
+  - Contribuindo: contribuindo.md
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - admonition
+  - codehilite
+  - footnotes
+  - def_list
+  - pymdownx.extra
+  - pymdownx.highlight
+  - pymdownx.superfences
