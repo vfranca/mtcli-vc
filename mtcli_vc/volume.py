@@ -6,7 +6,7 @@ from mtcli_vc.views.volume_view import exibir_comparacao
 
 
 @click.command()
-@click.version_option(package_name="mtcli-volcomp")
+@click.version_option(package_name="mtcli-vc")
 @click.option(
     "--symbol",
     "-s",

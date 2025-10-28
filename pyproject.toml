@@ -1,6 +1,6 @@
 [project]
 name = "mtcli-vc"
-version = "1.0.0.dev1"
+version = "1.0.0.dev2"
 description = "Plugin do mtcli"
 authors = [
     {name = "Valmir França da Silva",email = "vfranca3@gmail.com"}
