@@ -1,11 +1,9 @@
-from datetime import datetime, timedelta
-
 import MetaTrader5 as mt5
 import pandas as pd
+from datetime import datetime, timedelta, UTC
 import pytz
-
-from mtcli.logger import setup_logger
 from mtcli_vc.conf import TIMEZONE
+from mtcli.logger import setup_logger
 
 log = setup_logger()
 tz = pytz.timezone(TIMEZONE)
@@ -13,40 +11,82 @@ tz = pytz.timezone(TIMEZONE)
 
 def obter_dados(symbol: str, days: int):
     """
-    Obtém candles M1 dos últimos N dias, com margem extra para cobrir fins de semana/feriados.
-    Garante que a conexão com o MetaTrader5 seja finalizada mesmo em erro.
+    Obtém candles M1 dos últimos N dias.
+
+    Funciona com:
+      - Forex / ActivTrades → usa copy_rates_range()
+      - B3 / Clear / XP     → usa fallback copy_rates_from() com paginação (máx. 1000 candles/bloco)
+
+    Compatível com Python 3.13+ (usa datetime.UTC em vez de datetime.utcnow()).
     """
     if days is None or days < 1:
         raise ValueError("Parâmetro 'days' deve ser inteiro positivo.")
 
-    agora = datetime.now(tz)
-    inicio = agora - timedelta(
-        days=days + 10
-    )  # margem para cobrir fins de semana/feriados
+    # Horário local e UTC
+    agora_local = datetime.now(tz)
+    inicio_local = agora_local - timedelta(days=days + 10)
+
+    # Datas UTC naive (sem tzinfo, exigido pelo MetaTrader5)
+    agora = datetime.now(UTC).replace(tzinfo=None)
+    inicio = inicio_local.astimezone(UTC).replace(tzinfo=None)
 
     initialized = False
     try:
         initialized = mt5.initialize()
         if not initialized:
             raise RuntimeError("Erro ao conectar ao MetaTrader5")
-        log.debug(
-            f"MT5 inicializado. Coletando dados de {symbol} desde {inicio.isoformat()} até {agora.isoformat()}"
-        )
 
+        log.debug(f"MT5 inicializado. Coletando dados de {symbol} desde {inicio} até {agora} (UTC naive)")
+
+        # Garante que o símbolo esteja visível no Market Watch
+        info = mt5.symbol_info(symbol)
+        if info is None or not info.visible:
+            log.warning(f"Símbolo '{symbol}' não está visível. Tentando selecionar...")
+            if not mt5.symbol_select(symbol, True):
+                raise RuntimeError(f"Não foi possível selecionar o símbolo '{symbol}'. Verifique no MT5 se está ativo.")
+
+        # 1️⃣ Tenta método padrão (funciona no Forex / ActivTrades)
         rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, inicio, agora)
         if rates is None:
-            raise RuntimeError(f"Erro ao obter dados para {symbol} (rates is None)")
+            code, reason = mt5.last_error()
+            log.warning(f"Erro copy_rates_range: {code} - {reason}")
 
+            # 2️⃣ Fallback para Clear / B3 (limite de 1000 candles)
+            if code == -2:
+                log.info("Servidor limita a 1000 candles. Ativando modo de paginação (copy_rates_from).")
+
+                candles_total = []
+                total_candles = int((days + 10) * 1440)  # minutos no período
+                fetched = 0
+                chunk = 1000
+                cursor_time = agora
+
+                while fetched < total_candles:
+                    rates_chunk = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M1, cursor_time, chunk)
+                    if rates_chunk is None or len(rates_chunk) == 0:
+                        log.debug(f"Nenhum dado adicional após {fetched} candles. last_error={mt5.last_error()}")
+                        break
+
+                    candles_total.extend(rates_chunk)
+                    fetched += len(rates_chunk)
+
+                    # Atualiza o cursor para o candle mais antigo do último bloco
+                    oldest_time = rates_chunk[0]["time"]
+                    cursor_time = datetime.fromtimestamp(oldest_time, UTC)
+                    log.debug(f"Baixados {fetched} candles até {cursor_time.isoformat()}")
+
+                    # Se não conseguiu 1000, significa que acabou o histórico
+                    if len(rates_chunk) < chunk:
+                        break
+
+                rates = candles_total[::-1]  # inverter para ordem cronológica crescente
+
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"Nenhum dado retornado para {symbol}. Verifique histórico e horário de pregão.")
+
+        # Cria DataFrame e converte timestamps
         df = pd.DataFrame(rates)
-        if df.empty:
-            raise RuntimeError(
-                f"Nenhum dado retornado para {symbol}. Verifique se o símbolo está correto e se há pregão."
-            )
-
-        # converte timestamp em timezone configurado
-        df["time"] = (
-            pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(tz)
-        )
+        df["time"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(tz)
         return df
 
     finally:
@@ -55,41 +95,28 @@ def obter_dados(symbol: str, days: int):
                 mt5.shutdown()
                 log.debug("MT5 finalizado (shutdown).")
             except Exception:
-                # Não propaga erros de shutdown para não mascarar a exceção principal
                 log.exception("Falha ao finalizar MT5 (shutdown).")
 
 
 def encontrar_ultimo_dia_com_volume(df, hoje, col_volume):
-    """
-    Retorna o último dia de pregão antes de 'hoje' com volume > 0.
-    Percorre as datas de forma decrescente e ignora dias >= hoje.
-    """
+    """Retorna o último dia de pregão antes de 'hoje' com volume > 0."""
     if df.empty:
         return None
-
-    # usamos unique ordenado decrescente
     for dia in sorted(df["date"].unique(), reverse=True):
         if dia >= hoje:
             continue
-        # soma direta; pode retornar numpy types -> convert later
-        volume = df.loc[df["date"] == dia, col_volume].sum()
-        try:
-            if float(volume) > 0.0:
-                return dia
-        except Exception:
-            # se não for conversível, ignora esse dia
-            continue
+        volume = float(df.loc[df["date"] == dia, col_volume].sum())
+        if volume > 0:
+            return dia
     return None
 
 
 def calcular_volume_comparativo(symbol: str, days: int, volume_type: str):
     """
-    Calcula volumes:
-      - vol_hoje: volume do dia atual até hora atual
-      - vol_ontem: volume do último pregão válido até mesma hora
-      - vol_medio: média dos últimos `days` pregões válidos (excluindo hoje) até a mesma hora
-
-    Retorna dicionário com valores float e percentuais.
+    Calcula e compara:
+      - volume do dia atual até o momento
+      - volume do último pregão válido até o mesmo horário
+      - volume médio dos últimos N pregões até o mesmo horário
     """
     if days is None or days < 1:
         raise ValueError("O parâmetro 'days' deve ser inteiro >= 1.")
@@ -99,55 +126,31 @@ def calcular_volume_comparativo(symbol: str, days: int, volume_type: str):
     hora_atual = agora.time()
     hoje = agora.date()
 
-    # segurança: se df for None ou vazio, obter_dados já levantou RuntimeError.
     df["date"] = df["time"].dt.date
     df["hora"] = df["time"].dt.time
 
-    # Define coluna de volume
     col_volume = "tick_volume" if volume_type == "tick" else "real_volume"
     if col_volume not in df.columns:
-        raise ValueError(
-            f"Coluna de volume '{col_volume}' não encontrada nos dados para o símbolo {symbol}"
-        )
+        raise ValueError(f"Coluna '{col_volume}' não encontrada nos dados para {symbol}")
 
-    # Volume de hoje
-    vol_hoje = float(
-        df.loc[(df["date"] == hoje) & (df["hora"] <= hora_atual), col_volume].sum()
-    )
+    vol_hoje = float(df.loc[(df["date"] == hoje) & (df["hora"] <= hora_atual), col_volume].sum())
 
-    # Último pregão válido (pula domingos/feriados)
     ontem = encontrar_ultimo_dia_com_volume(df, hoje, col_volume)
     if ontem is None:
-        # não encontrou pregão anterior; pode ocorrer em ativos recém listados
-        raise RuntimeError(
-            "Não foi possível encontrar o último dia de pregão válido antes de hoje."
-        )
+        raise RuntimeError("Não foi possível encontrar o último dia de pregão válido antes de hoje.")
 
-    vol_ontem = float(
-        df.loc[(df["date"] == ontem) & (df["hora"] <= hora_atual), col_volume].sum()
-    )
+    vol_ontem = float(df.loc[(df["date"] == ontem) & (df["hora"] <= hora_atual), col_volume].sum())
 
-    # Média dos últimos N dias de pregão (excluindo hoje)
-    dias_passados = [d for d in sorted(df["date"].unique(), reverse=True) if d < hoje]
-    dias_passados = dias_passados[:days]
+    dias_passados = [d for d in sorted(df["date"].unique(), reverse=True) if d < hoje][:days]
+    volumes = [
+        float(df.loc[(df["date"] == d) & (df["hora"] <= hora_atual), col_volume].sum())
+        for d in dias_passados
+        if float(df.loc[(df["date"] == d), col_volume].sum()) > 0
+    ]
+    vol_medio = sum(volumes) / len(volumes) if volumes else 0.0
 
-    volumes = []
-    for d in dias_passados:
-        v = float(
-            df.loc[(df["date"] == d) & (df["hora"] <= hora_atual), col_volume].sum()
-        )
-        if v > 0:
-            volumes.append(v)
-
-    vol_medio = float(sum(volumes) / len(volumes)) if volumes else 0.0
-
-    # Comparações percentuais (float evita overflow)
-    perc_ontem = (
-        ((vol_hoje - vol_ontem) / vol_ontem * 100.0) if vol_ontem > 0.0 else 0.0
-    )
-    perc_medio = (
-        ((vol_hoje - vol_medio) / vol_medio * 100.0) if vol_medio > 0.0 else 0.0
-    )
+    perc_ontem = ((vol_hoje - vol_ontem) / vol_ontem * 100.0) if vol_ontem > 0 else 0.0
+    perc_medio = ((vol_hoje - vol_medio) / vol_medio * 100.0) if vol_medio > 0 else 0.0
 
     return {
         "symbol": symbol,
